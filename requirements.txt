@@ -1,0 +1,5 @@
+livekit-agents
+livekit-plugins-silero
+asyncpg
+python-dotenv
+faster-whisper>=1.0.0
