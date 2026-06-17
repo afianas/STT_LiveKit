@@ -40,8 +40,11 @@ class SessionManager:
         # Maps participant identity -> their active AgentSession
         self._sessions: dict[str, AgentSession] = {}
 
-        # Tracks in-flight async tasks so we can cancel them on shutdown
-        self._tasks: set[asyncio.Task] = set()
+        # Tracks in-flight session starting tasks (safe to cancel on shutdown)
+        self._start_tasks: set[asyncio.Task] = set()
+
+        # Tracks in-flight session closing tasks (MUST NOT cancel on shutdown, wait for them)
+        self._close_tasks: set[asyncio.Task] = set()
 
     def start(self):
         """Register event listeners for the room."""
@@ -52,15 +55,24 @@ class SessionManager:
         """
         Graceful shutdown:
         1. Cancel any pending session-start tasks
-        2. Drain and close all active sessions
-        3. Unregister room event listeners
-        4. Mark meeting as ended in DB
+        2. Wait for all in-flight session-close tasks
+        3. Cleanly close all remaining active sessions
+        4. Unregister room event listeners
+        5. Mark meeting as ended in DB
         """
-        await utils.aio.cancel_and_wait(*self._tasks)
+        # Cancel any startup in progress
+        await utils.aio.cancel_and_wait(*self._start_tasks)
 
-        await asyncio.gather(
-            *[self._close_session(s) for s in self._sessions.values()]
-        )
+        # Wait for all existing close/disconnect tasks to finish
+        if self._close_tasks:
+            await asyncio.gather(*self._close_tasks, return_exceptions=True)
+
+        # Cleanly close all remaining active sessions
+        if self._sessions:
+            await asyncio.gather(
+                *[self._close_session(s) for s in self._sessions.values()],
+                return_exceptions=True
+            )
 
         self.ctx.room.off("participant_connected", self.on_participant_connected)
         self.ctx.room.off("participant_disconnected", self.on_participant_disconnected)
@@ -78,7 +90,7 @@ class SessionManager:
 
         logger.info(f"Participant joined: {participant.identity}")
         task = asyncio.create_task(self._start_session(participant))
-        self._tasks.add(task)
+        self._start_tasks.add(task)
 
         def on_done(t: asyncio.Task):
             try:
@@ -88,7 +100,7 @@ class SessionManager:
             except Exception as e:
                 logger.error(f"Error starting session for {participant.identity}: {e}", exc_info=True)
             finally:
-                self._tasks.discard(t)
+                self._start_tasks.discard(t)
 
         task.add_done_callback(on_done)
 
@@ -103,7 +115,7 @@ class SessionManager:
 
         logger.info(f"Participant left: {participant.identity}")
         task = asyncio.create_task(self._close_session(session))
-        self._tasks.add(task)
+        self._close_tasks.add(task)
 
         def on_done(t: asyncio.Task):
             try:
@@ -112,7 +124,7 @@ class SessionManager:
             except Exception as e:
                 logger.error(f"Error closing session for {participant.identity}: {e}", exc_info=True)
             finally:
-                self._tasks.discard(t)
+                self._close_tasks.discard(t)
 
         task.add_done_callback(on_done)
 
