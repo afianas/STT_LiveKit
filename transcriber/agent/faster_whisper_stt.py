@@ -63,6 +63,16 @@ class FasterWhisperSTT(stt.STT):
     framework, enabling fully local speech-to-text without cloud dependencies.
     """
 
+    # Process-wide lock shared across ALL instances (and any per-session wrappers
+    # the framework creates). Guarantees only one CTranslate2/CUDA inference runs
+    # at a time, preventing cuBLAS conflicts when multiple participants speak
+    # simultaneously.
+    #
+    # Initialised eagerly at class-definition time. asyncio.Lock in Python 3.10+
+    # does NOT bind to the event loop at construction — it binds on first await,
+    # so this is safe to create here without a running event loop.
+    _process_inference_lock: asyncio.Lock = asyncio.Lock()
+
     def __init__(
         self,
         model_size: ModelSize = "medium",
@@ -94,6 +104,7 @@ class FasterWhisperSTT(stt.STT):
         )
 
         logger.info(f"FasterWhisper ready - language={language}, beam_size={beam_size}")
+
 
     async def _recognize_impl(
         self,
@@ -160,7 +171,8 @@ class FasterWhisperSTT(stt.STT):
             # Evaluate the generator inside the thread to do the heavy computation
             return list(segments_generator), info
 
-        segments, info = await asyncio.to_thread(run_inference)
+        async with FasterWhisperSTT._process_inference_lock:
+            segments, info = await asyncio.to_thread(run_inference)
         
         # Combine all segments into final text
         text = "".join(segment.text for segment in segments).strip()

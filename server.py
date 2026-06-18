@@ -1,5 +1,4 @@
 import os
-import asyncio
 import logging
 
 from dotenv import load_dotenv
@@ -7,7 +6,6 @@ from livekit.agents import AgentServer, AutoSubscribe, JobContext, JobProcess, c
 from livekit.plugins import silero
 
 from transcriber.agent import SessionManager, FasterWhisperSTT
-from transcriber.db import create_pool, ensure_schema, upsert_meeting
 
 load_dotenv()
 
@@ -18,35 +16,23 @@ server = AgentServer(
     initialize_process_timeout=60.0,
 )
 
-# Global lock to serialize database pool initialization across concurrent room connections in the same process
-db_init_lock = asyncio.Lock()
-
 
 @server.rtc_session(agent_name="transcriber")
 async def entrypoint(ctx: JobContext):
-    # Cache DB pool in proc.userdata so that it is reused across meetings in the same process.
-    db_pool = ctx.proc.userdata.get("db_pool")
-    if db_pool is None:
-        async with db_init_lock:
-            # Double-check inside lock to prevent race conditions
-            db_pool = ctx.proc.userdata.get("db_pool")
-            if db_pool is None:
-                db_pool = await create_pool()
-                await ensure_schema(db_pool)
-                ctx.proc.userdata["db_pool"] = db_pool
-
     meeting_id = ctx.room.name
-    await upsert_meeting(db_pool, meeting_id)
     logger.info(f"Transcription started for meeting: {meeting_id}")
 
     session_manager = SessionManager(
         ctx=ctx,
-        db_pool=db_pool,
         meeting_id=meeting_id,
     )
-    session_manager.start()
-
+    # Connect first so the participant list is fully populated before we
+    # register event listeners. This prevents participant_connected from firing
+    # for a participant who is also present in remote_participants, which would
+    # cause _start_session to run twice for the same identity.
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
+    session_manager.start()  # register event handlers only after connect
 
     for participant in ctx.room.remote_participants.values():
         session_manager.on_participant_connected(participant)
